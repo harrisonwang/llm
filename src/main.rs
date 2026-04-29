@@ -1,5 +1,5 @@
 use anyhow::{Context, Result, anyhow};
-use clap::{Parser, Subcommand};
+use clap::{ArgAction, Parser, Subcommand};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -7,35 +7,84 @@ use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::PathBuf;
 
+const HELP_TEMPLATE: &str = "\
+{before-help}{about-with-newline}
+用法 (Usage):
+  {usage}
+
+命令 (Commands):
+{subcommands}
+
+参数 (Arguments):
+{positionals}
+
+选项 (Options):
+{options}
+
+示例 (Examples):
+  llm \"Explain TCP three-way handshake\"
+  llm -m gpt-4.1-mini \"Summarize this\"
+  cat report.md | llm \"Summarize risks and action items\"{after-help}";
+
+const COMMAND_HELP_TEMPLATE: &str = "\
+{before-help}{about-with-newline}
+用法 (Usage):
+  {usage}
+
+选项 (Options):
+{options}
+
+示例 (Examples):
+  llm config --base-url https://api.openai.com/v1 --model gpt-4.1-mini
+  llm config --base-url http://localhost:11434/v1 --model llama3.2 --api-key local{after-help}";
+
 #[derive(Parser, Debug)]
-#[command(name = "llm", version, about = "Minimal OpenAI-compatible LLM CLI")]
+#[command(
+    name = "llm",
+    version,
+    about = "极简 LLM CLI",
+    help_template = HELP_TEMPLATE,
+    override_usage = "llm [OPTIONS] [prompt]... [COMMAND]",
+    disable_help_flag = true,
+    disable_version_flag = true,
+    disable_help_subcommand = true
+)]
 struct Cli {
-    /// Prompt. If stdin is piped too, stdin is treated as context and this is the instruction.
+    /// 用户 prompt；如果 stdin 有输入，则 stdin 作为上下文，prompt 作为指令。
+    #[arg(value_name = "prompt")]
     prompt: Vec<String>,
 
-    /// Model to use. Overrides config and LLM_MODEL.
-    #[arg(short, long, env = "LLM_MODEL")]
+    /// 使用的 model；覆盖配置文件和 env: LLM_MODEL。
+    #[arg(short, long, env = "LLM_MODEL", hide_env = true, value_name = "model")]
     model: Option<String>,
 
-    /// Base URL, e.g. https://api.openai.com/v1 or http://localhost:11434/v1.
-    #[arg(long, env = "LLM_BASE_URL")]
+    /// provider API base URL；env: LLM_BASE_URL。
+    #[arg(long, env = "LLM_BASE_URL", hide_env = true, value_name = "base-url")]
     base_url: Option<String>,
 
-    /// API key. Overrides config and LLM_API_KEY.
-    #[arg(long, env = "LLM_API_KEY")]
+    /// API key；覆盖配置文件和 env: LLM_API_KEY。
+    #[arg(long, env = "LLM_API_KEY", hide_env = true, value_name = "api-key")]
     api_key: Option<String>,
 
-    /// System prompt.
-    #[arg(short, long)]
+    /// system prompt。
+    #[arg(short, long, value_name = "system-prompt")]
     system: Option<String>,
 
-    /// Stream tokens as they arrive. This is the default.
+    /// streaming 输出；默认开启。
     #[arg(long, conflicts_with = "no_stream")]
     stream: bool,
 
-    /// Disable streaming; wait and print the complete response.
+    /// 关闭 streaming，等待完整响应后输出。
     #[arg(long)]
     no_stream: bool,
+
+    /// 显示帮助。
+    #[arg(short = 'h', long = "help", action = ArgAction::Help, global = true)]
+    help: Option<bool>,
+
+    /// 显示版本。
+    #[arg(short = 'V', long = "version", action = ArgAction::Version)]
+    version: Option<bool>,
 
     #[command(subcommand)]
     command: Option<Command>,
@@ -43,18 +92,22 @@ struct Cli {
 
 #[derive(Subcommand, Debug)]
 enum Command {
-    /// Write ~/.config/llm/config.toml.
+    /// 写入配置文件。
+    #[command(
+        help_template = COMMAND_HELP_TEMPLATE,
+        override_usage = "llm config --base-url <base-url> --model <model> [OPTIONS]"
+    )]
     Config {
-        /// Base URL, e.g. https://api.openai.com/v1 or http://localhost:11434/v1.
-        #[arg(long)]
+        /// provider API base URL。
+        #[arg(long, value_name = "base-url")]
         base_url: String,
 
-        /// Default model.
-        #[arg(long)]
+        /// 默认 model。
+        #[arg(long, value_name = "model")]
         model: String,
 
-        /// API key. For local OpenAI-compatible servers, use any non-empty value.
-        #[arg(long)]
+        /// API key；本地 LLM server 可使用任意非空值。
+        #[arg(long, value_name = "api-key")]
         api_key: Option<String>,
     },
 }
@@ -443,6 +496,68 @@ mod tests {
     #[test]
     fn explicit_stream_flag_conflicts_with_no_stream() {
         assert!(Cli::try_parse_from(["llm", "--stream", "--no-stream", "hello"]).is_err());
+    }
+
+    #[test]
+    fn prompt_without_flags_still_parses() {
+        let cli = Cli::try_parse_from(["llm", "hi"]).unwrap();
+
+        assert_eq!(cli.prompt, ["hi"]);
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn top_level_help_is_chinese() {
+        let err = Cli::try_parse_from(["llm", "-h"]).unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = err.to_string();
+        assert!(help.contains("极简 LLM CLI"));
+        assert!(help.contains("用法 (Usage):"));
+        assert!(help.contains("llm [OPTIONS] [prompt]... [COMMAND]"));
+        assert!(help.contains("命令 (Commands):"));
+        assert!(help.contains("参数 (Arguments):"));
+        assert!(help.contains("选项 (Options):"));
+        assert!(help.contains("--model <model>"));
+        assert!(help.contains("env: LLM_MODEL"));
+        assert!(help.contains("--base-url <base-url>"));
+        assert!(help.contains("provider API base URL"));
+        assert!(help.contains("--api-key <api-key>"));
+        assert!(help.contains("--system <system-prompt>"));
+        assert!(help.contains("示例 (Examples):"));
+        assert!(help.contains("cat report.md | llm \"Summarize risks and action items\""));
+        assert!(help.contains("显示帮助。"));
+        assert!(!help.contains("提示词"));
+        assert!(!help.contains("<模型>"));
+        assert!(!help.contains("OpenAI-compatible"));
+        assert!(!help.contains("Usage:"));
+        assert!(!help.contains("Options:"));
+    }
+
+    #[test]
+    fn config_help_is_chinese() {
+        let err = Cli::try_parse_from(["llm", "config", "-h"]).unwrap_err();
+
+        assert_eq!(err.kind(), clap::error::ErrorKind::DisplayHelp);
+        let help = err.to_string();
+        assert!(help.contains("写入配置文件。"));
+        assert!(help.contains("用法 (Usage):"));
+        assert!(help.contains("llm config --base-url <base-url> --model <model> [OPTIONS]"));
+        assert!(help.contains("--base-url <base-url>"));
+        assert!(help.contains("provider API base URL"));
+        assert!(help.contains("--model <model>"));
+        assert!(help.contains("--api-key <api-key>"));
+        assert!(help.contains("默认 model。"));
+        assert!(help.contains("本地 LLM server"));
+        assert!(help.contains("示例 (Examples):"));
+        assert!(help.contains(
+            "llm config --base-url http://localhost:11434/v1 --model llama3.2 --api-key local"
+        ));
+        assert!(help.contains("显示帮助。"));
+        assert!(!help.contains("<地址>"));
+        assert!(!help.contains("<模型>"));
+        assert!(!help.contains("Usage:"));
+        assert!(!help.contains("Options:"));
     }
 
     #[test]
