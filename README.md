@@ -60,6 +60,7 @@ stdin 会作为上下文，命令参数作为指令：
 
 ```bash
 gist report.pdf | llm "总结这份报告，列出风险和行动项"
+gist report.pdf | llm --stream "总结这份报告，列出风险和行动项"
 ```
 
 只从 stdin 读取 prompt：
@@ -71,6 +72,7 @@ echo "解释一下 transformer attention" | llm
 默认使用 streaming。需要等待完整响应时：
 
 ```bash
+llm --stream "hello"
 llm --no-stream "hello"
 ```
 
