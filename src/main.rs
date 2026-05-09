@@ -7,7 +7,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 mod search;
 
@@ -31,6 +31,7 @@ const HELP_TEMPLATE: &str = "\
   llm -p local \"Draft quickly\"
   llm models
   llm models -p talkweb
+  llm -a screenshot.png \"What is wrong with this UI?\"
   llm --no-render \"Write markdown\"
   cat report.md | llm \"Summarize risks and action items\"
   EXA_API_KEY=... llm --search \"Rust 2026 edition changes\"{after-help}";
@@ -87,6 +88,10 @@ struct Cli {
     /// system prompt。
     #[arg(short, long, value_name = "system-prompt")]
     system: Option<String>,
+
+    /// 附加图片文件；PDF 请先用 pith 转文本后通过 stdin 传入。
+    #[arg(short = 'a', long = "attach", value_name = "path")]
+    attachments: Vec<PathBuf>,
 
     /// 使用搜索 API 获取搜索上下文；只使用命令行 prompt 作为搜索 query。
     #[arg(long)]
@@ -234,7 +239,38 @@ struct StreamOptions {
 #[derive(Debug, Serialize)]
 struct Message {
     role: String,
-    content: String,
+    content: MessageContent,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum MessageContent {
+    Text(String),
+    Parts(Vec<ContentPart>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum ContentPart {
+    Text { text: String },
+    ImageUrl { image_url: ImageUrl },
+}
+
+#[derive(Debug, Serialize)]
+struct ImageUrl {
+    url: String,
+}
+
+#[derive(Debug)]
+struct ImageAttachment {
+    data_url: String,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AttachmentKind {
+    Image(&'static str),
+    Pdf,
+    Unsupported,
 }
 
 #[derive(Debug, Deserialize)]
@@ -368,6 +404,7 @@ async fn run() -> Result<()> {
     )
     .unwrap();
 
+    let has_attachments = !cli.attachments.is_empty();
     let prompt = if let Some((query, instruction, credentials)) = search_options {
         let mut stderr = io::stderr();
         write_search_provider_notice(credentials.provider, &mut stderr)?;
@@ -376,19 +413,20 @@ async fn run() -> Result<()> {
                 .await?;
         search::build_prompt_with_search(stdin, &search_context, &instruction)
     } else {
-        build_prompt(stdin, prompt_arg)?
+        build_prompt(stdin, prompt_arg, has_attachments)?
     };
 
     let mut messages = Vec::new();
     if let Some(system) = cli.system {
         messages.push(Message {
             role: "system".to_string(),
-            content: system,
+            content: MessageContent::Text(system),
         });
     }
+    let attachments = read_image_attachments(&cli.attachments)?;
     messages.push(Message {
         role: "user".to_string(),
-        content: prompt,
+        content: build_user_message_content(prompt, attachments),
     });
 
     let pricing = config.pricing.get(&model).copied();
@@ -494,7 +532,11 @@ fn first_value(
         .filter(|s| !s.is_empty())
 }
 
-fn build_prompt(stdin: Option<String>, prompt_arg: String) -> Result<String> {
+fn build_prompt(
+    stdin: Option<String>,
+    prompt_arg: String,
+    has_attachments: bool,
+) -> Result<String> {
     let prompt_arg = prompt_arg.trim().to_string();
     match (stdin, prompt_arg.is_empty()) {
         (Some(context), false) => Ok(format!(
@@ -504,10 +546,102 @@ fn build_prompt(stdin: Option<String>, prompt_arg: String) -> Result<String> {
         )),
         (Some(context), true) => Ok(context),
         (None, false) => Ok(prompt_arg),
+        (None, true) if has_attachments => Ok("Describe the attached image.".to_string()),
         (None, true) => Err(anyhow!(
             "missing prompt; try `llm \"hello\"` or pipe text into `llm`"
         )),
     }
+}
+
+fn build_user_message_content(prompt: String, attachments: Vec<ImageAttachment>) -> MessageContent {
+    if attachments.is_empty() {
+        return MessageContent::Text(prompt);
+    }
+
+    let mut parts = Vec::with_capacity(attachments.len() + 1);
+    parts.push(ContentPart::Text { text: prompt });
+    parts.extend(
+        attachments
+            .into_iter()
+            .map(|attachment| ContentPart::ImageUrl {
+                image_url: ImageUrl {
+                    url: attachment.data_url,
+                },
+            }),
+    );
+    MessageContent::Parts(parts)
+}
+
+fn read_image_attachments(paths: &[PathBuf]) -> Result<Vec<ImageAttachment>> {
+    paths
+        .iter()
+        .map(|path| {
+            let kind = attachment_kind(path);
+            match kind {
+                AttachmentKind::Image(mime_type) => {
+                    let bytes = fs::read(path)
+                        .with_context(|| format!("failed to read attachment: {}", path.display()))?;
+                    Ok(ImageAttachment {
+                        data_url: image_data_url(mime_type, &bytes),
+                    })
+                }
+                AttachmentKind::Pdf => Err(anyhow!(
+                    "PDF attachments are not supported; use `pith {} | llm \"...\"` instead",
+                    path.display()
+                )),
+                AttachmentKind::Unsupported => Err(anyhow!(
+                    "unsupported attachment type: {}; only png, jpg, jpeg, gif, and webp images are supported",
+                    path.display()
+                )),
+            }
+        })
+        .collect()
+}
+
+fn image_data_url(mime_type: &str, bytes: &[u8]) -> String {
+    format!("data:{mime_type};base64,{}", base64_encode(bytes))
+}
+
+fn attachment_kind(path: &Path) -> AttachmentKind {
+    let Some(extension) = path.extension().and_then(|extension| extension.to_str()) else {
+        return AttachmentKind::Unsupported;
+    };
+
+    match extension.to_ascii_lowercase().as_str() {
+        "png" => AttachmentKind::Image("image/png"),
+        "jpg" | "jpeg" => AttachmentKind::Image("image/jpeg"),
+        "gif" => AttachmentKind::Image("image/gif"),
+        "webp" => AttachmentKind::Image("image/webp"),
+        "pdf" => AttachmentKind::Pdf,
+        _ => AttachmentKind::Unsupported,
+    }
+}
+
+fn base64_encode(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::with_capacity(bytes.len().div_ceil(3) * 4);
+
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        let n = ((b0 as u32) << 16) | ((b1 as u32) << 8) | b2 as u32;
+
+        encoded.push(TABLE[((n >> 18) & 0x3f) as usize] as char);
+        encoded.push(TABLE[((n >> 12) & 0x3f) as usize] as char);
+        if chunk.len() > 1 {
+            encoded.push(TABLE[((n >> 6) & 0x3f) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+        if chunk.len() > 2 {
+            encoded.push(TABLE[(n & 0x3f) as usize] as char);
+        } else {
+            encoded.push('=');
+        }
+    }
+
+    encoded
 }
 
 fn build_usage_summary(usage: Usage, pricing: Option<ModelPricing>) -> UsageSummary {
@@ -1010,6 +1144,7 @@ mod tests {
         let prompt = build_prompt(
             Some("# Report\n\nA finding from pith.\n".to_string()),
             "总结风险和行动项".to_string(),
+            false,
         )
         .unwrap();
 
@@ -1022,6 +1157,32 @@ mod tests {
     #[test]
     fn explicit_stream_flag_conflicts_with_no_stream() {
         assert!(Cli::try_parse_from(["llm", "--stream", "--no-stream", "hello"]).is_err());
+    }
+
+    #[test]
+    fn attachment_flag_parses() {
+        let cli = Cli::try_parse_from(["llm", "-a", "screenshot.png", "检查 UI"]).unwrap();
+
+        assert_eq!(cli.attachments, [PathBuf::from("screenshot.png")]);
+        assert_eq!(cli.prompt, ["检查 UI"]);
+    }
+
+    #[test]
+    fn repeated_attachment_flags_parse() {
+        let cli = Cli::try_parse_from([
+            "llm",
+            "--attach",
+            "one.png",
+            "-a",
+            "two.jpg",
+            "比较这两张图",
+        ])
+        .unwrap();
+
+        assert_eq!(
+            cli.attachments,
+            [PathBuf::from("one.png"), PathBuf::from("two.jpg")]
+        );
     }
 
     #[test]
@@ -1086,6 +1247,68 @@ mod tests {
         assert!(!should_render_for(false, false));
         assert!(!should_render_for(true, true));
         assert!(!should_render_for(true, false));
+    }
+
+    #[test]
+    fn build_prompt_defaults_when_only_attachment_is_present() {
+        let prompt = build_prompt(None, String::new(), true).unwrap();
+
+        assert_eq!(prompt, "Describe the attached image.");
+    }
+
+    #[test]
+    fn image_data_url_base64_encodes_bytes() {
+        assert_eq!(
+            image_data_url("image/png", b"hello"),
+            "data:image/png;base64,aGVsbG8="
+        );
+    }
+
+    #[test]
+    fn attachment_kind_detects_supported_images() {
+        assert_eq!(
+            attachment_kind(Path::new("a.PNG")),
+            AttachmentKind::Image("image/png")
+        );
+        assert_eq!(
+            attachment_kind(Path::new("a.jpeg")),
+            AttachmentKind::Image("image/jpeg")
+        );
+        assert_eq!(
+            attachment_kind(Path::new("a.webp")),
+            AttachmentKind::Image("image/webp")
+        );
+    }
+
+    #[test]
+    fn attachment_kind_rejects_pdf_boundary() {
+        assert_eq!(attachment_kind(Path::new("doc.pdf")), AttachmentKind::Pdf);
+    }
+
+    #[test]
+    fn pdf_attachment_errors_with_pith_guidance() {
+        let err = read_image_attachments(&[PathBuf::from("doc.pdf")])
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("PDF attachments are not supported"));
+        assert!(err.contains("pith doc.pdf | llm"));
+    }
+
+    #[test]
+    fn user_message_with_attachment_uses_openai_image_block() {
+        let content = build_user_message_content(
+            "检查 UI".to_string(),
+            vec![ImageAttachment {
+                data_url: "data:image/png;base64,AAAA".to_string(),
+            }],
+        );
+        let value = serde_json::to_value(&content).unwrap();
+
+        assert_eq!(value[0]["type"], "text");
+        assert_eq!(value[0]["text"], "检查 UI");
+        assert_eq!(value[1]["type"], "image_url");
+        assert_eq!(value[1]["image_url"]["url"], "data:image/png;base64,AAAA");
     }
 
     #[test]

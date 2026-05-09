@@ -116,6 +116,7 @@ llm models
 llm models -p talkweb
 llm --no-render "输出原始 markdown"
 llm -m gpt-4.1-mini "解释 TCP 三次握手"
+llm -a screenshot.png "这截图里 UI 哪里有问题"
 llm -s "你是严谨的代码审查员" "审查这段代码"
 llm --search "Rust 2026 edition 最新变化"
 ```
@@ -146,6 +147,15 @@ llm models --base-url http://localhost:11434/v1 --api-key local
 ```bash
 pith -h https://example.com | llm "总结这页"
 ```
+
+图片可以用 `-a/--attach` 直接作为多模态输入传给模型：
+
+```bash
+llm -a screenshot.png "这截图里 UI 哪里有问题"
+llm -a one.png -a two.jpg "比较这两张图"
+```
+
+`-a` 只支持图片（png、jpg、jpeg、gif、webp）。PDF 和网页这类需要预处理的输入继续交给上游 CLI，例如 `pith doc.pdf | llm "总结这份文档"`。
 
 `--search` 会用命令行 prompt 作为问题；如果 stdin 有输入，也会把 stdin 的前部一起作为搜索查询，并把 stdin 原文作为模型上下文：
 
