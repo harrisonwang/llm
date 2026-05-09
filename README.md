@@ -6,6 +6,14 @@
 llm "解释一下 Rust ownership"
 ```
 
+## 安装
+
+发布后可以通过 Homebrew tap 安装：
+
+```bash
+brew install harrisonwang/tap/llm
+```
+
 ## 配置
 
 先设置 OpenAI-compatible endpoint：
@@ -38,10 +46,12 @@ llm config \
 llm config --model deepseek-v4
 llm config --base-url https://api.deepseek.com/v1
 llm config --api-key "$DEEPSEEK_API_KEY"
+llm config --search-provider exa
+llm config --exa-api-key "$EXA_API_KEY"
 llm config --brave-api-key "$BRAVE_SEARCH_API_KEY"
 ```
 
-`--brave-api-key` 是独立配置，也可以在没有模型配置时单独写入。
+`--search-provider`、`--exa-api-key`、`--brave-api-key` 是独立搜索配置，也可以在没有模型配置时单独写入。`search_provider` 可选值是 `exa` 和 `brave`；未设置时按 `exa`、`brave` 的顺序自动选择已配置 key 的 provider。
 
 运行时取值优先级是命令行参数、环境变量、配置文件：
 
@@ -52,16 +62,19 @@ LLM_API_KEY="$OPENAI_API_KEY" \
 llm "hello"
 ```
 
-搜索模式需要 Brave Search API key：
+搜索模式需要 Exa 或 Brave Search API key：
 
 ```bash
+llm config --exa-api-key "$EXA_API_KEY"
 llm config --brave-api-key "$BRAVE_SEARCH_API_KEY"
 ```
 
 也可以在单次调用中传入：
 
 ```bash
+llm --exa-api-key "$EXA_API_KEY" --search "Rust 2026 edition 最新变化"
 llm --brave-api-key "$BRAVE_SEARCH_API_KEY" --search "Rust 2026 edition 最新变化"
+llm --search-provider brave --search "Rust 2026 edition 最新变化"
 ```
 
 ## 使用
@@ -92,11 +105,13 @@ echo "解释一下 transformer attention" | llm
 pith -h https://example.com | llm "总结这页"
 ```
 
-`--search` 会用命令行 prompt 作为问题；如果 stdin 有输入，也会把 stdin 的前部一起作为 Brave 查询，并把 stdin 原文作为模型上下文：
+`--search` 会用命令行 prompt 作为问题；如果 stdin 有输入，也会把 stdin 的前部一起作为搜索查询，并把 stdin 原文作为模型上下文：
 
 ```bash
 cargo -V | llm --search "这个版本的cargo有什么特性？"
 ```
+
+启用 `--search` 时会在 stderr 输出实际使用的 provider，例如 `search provider: exa`；stdout 仍只输出模型回答，方便继续管道处理。
 
 默认使用 streaming。需要等待完整响应时：
 
@@ -116,6 +131,6 @@ llm --no-stream "hello"
 - 无 schema mode
 - 无 provider 插件
 
-`--search` 当前是一次 Brave Search 预检索，不是模型自主调用工具。
+`--search` 当前是一次 Exa 或 Brave Search 预检索，不是模型自主调用工具。
 
 后续可以在不影响 `pith` 的前提下继续扩展。
