@@ -185,6 +185,8 @@ struct Config {
     brave_api_key: Option<String>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     profiles: BTreeMap<String, ProfileConfig>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pricing: BTreeMap<String, ModelPricing>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -199,6 +201,13 @@ struct ChatRequest {
     model: String,
     messages: Vec<Message>,
     stream: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
+}
+
+#[derive(Debug, Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -210,6 +219,7 @@ struct Message {
 #[derive(Debug, Deserialize)]
 struct ChatResponse {
     choices: Vec<Choice>,
+    usage: Option<Usage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -222,9 +232,28 @@ struct ResponseMessage {
     content: Option<String>,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize)]
+struct ModelPricing {
+    input_per_1m: Option<f64>,
+    output_per_1m: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+struct Usage {
+    prompt_tokens: u64,
+    completion_tokens: u64,
+}
+
+#[derive(Debug)]
+struct UsageSummary {
+    usage: Usage,
+    cost: Option<f64>,
+}
+
 #[derive(Debug, Deserialize)]
 struct StreamChunk {
     choices: Vec<StreamChoice>,
+    usage: Option<Usage>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -326,18 +355,22 @@ async fn run() -> Result<()> {
         content: prompt,
     });
 
+    let pricing = config.pricing.get(&model).copied();
     let stream = cli.stream || !cli.no_stream;
     let request = ChatRequest {
         model,
         messages,
         stream,
+        stream_options: stream.then_some(StreamOptions {
+            include_usage: true,
+        }),
     };
 
     let render = should_render(cli.no_render);
     if request.stream {
-        stream_chat(&base_url, &api_key, &request, render).await
+        stream_chat(&base_url, &api_key, &request, render, pricing).await
     } else {
-        complete_chat(&base_url, &api_key, &request, render).await
+        complete_chat(&base_url, &api_key, &request, render, pricing).await
     }
 }
 
@@ -396,6 +429,32 @@ fn build_prompt(stdin: Option<String>, prompt_arg: String) -> Result<String> {
     }
 }
 
+fn build_usage_summary(usage: Usage, pricing: Option<ModelPricing>) -> UsageSummary {
+    UsageSummary {
+        usage,
+        cost: pricing.and_then(|pricing| calculate_cost(usage, pricing)),
+    }
+}
+
+fn calculate_cost(usage: Usage, pricing: ModelPricing) -> Option<f64> {
+    let input_cost = pricing.input_per_1m? * usage.prompt_tokens as f64 / 1_000_000.0;
+    let output_cost = pricing.output_per_1m? * usage.completion_tokens as f64 / 1_000_000.0;
+    Some(input_cost + output_cost)
+}
+
+fn write_usage_summary<W: Write>(summary: &UsageSummary, out: &mut W) -> Result<()> {
+    write!(
+        out,
+        "tokens: {} in / {} out",
+        summary.usage.prompt_tokens, summary.usage.completion_tokens
+    )
+    .context("failed to write usage summary")?;
+    if let Some(cost) = summary.cost {
+        write!(out, ", ~${cost:.3}").context("failed to write usage summary")?;
+    }
+    writeln!(out).context("failed to write usage summary")
+}
+
 fn write_search_provider_notice<W: Write>(provider: SearchProvider, out: &mut W) -> Result<()> {
     writeln!(out, "search provider: {provider}").context("failed to write search provider notice")
 }
@@ -440,6 +499,7 @@ async fn complete_chat(
     api_key: &str,
     request: &ChatRequest,
     render: bool,
+    pricing: Option<ModelPricing>,
 ) -> Result<()> {
     let response: ChatResponse = client(api_key)
         .post(chat_url(base_url))
@@ -459,7 +519,12 @@ async fn complete_chat(
         .and_then(|choice| choice.message.content.as_deref())
         .unwrap_or("");
     let mut stdout = io::stdout();
-    write_markdown_output(text, render, &mut stdout)
+    write_markdown_output(text, render, &mut stdout)?;
+    if let Some(usage) = response.usage {
+        let mut stderr = io::stderr();
+        write_usage_summary(&build_usage_summary(usage, pricing), &mut stderr)?;
+    }
+    Ok(())
 }
 
 async fn stream_chat(
@@ -467,6 +532,7 @@ async fn stream_chat(
     api_key: &str,
     request: &ChatRequest,
     render: bool,
+    pricing: Option<ModelPricing>,
 ) -> Result<()> {
     let mut response = client(api_key)
         .post(chat_url(base_url))
@@ -480,12 +546,23 @@ async fn stream_chat(
     let mut stdout = io::stdout();
     let mut pending = Vec::new();
     let mut output = StreamOutput::new(render);
+    let mut usage = None;
     while let Some(chunk) = response.chunk().await.context("failed to read stream")? {
-        if write_stream_bytes(&mut pending, &chunk, &mut stdout, &mut output)? {
-            return output.finish(&mut stdout);
+        if write_stream_bytes(&mut pending, &chunk, &mut stdout, &mut output, &mut usage)? {
+            output.finish(&mut stdout)?;
+            if let Some(usage) = usage {
+                let mut stderr = io::stderr();
+                write_usage_summary(&build_usage_summary(usage, pricing), &mut stderr)?;
+            }
+            return Ok(());
         }
     }
-    finish_stream(&mut pending, &mut stdout, &mut output)
+    finish_stream(&mut pending, &mut stdout, &mut output, &mut usage)?;
+    if let Some(usage) = usage {
+        let mut stderr = io::stderr();
+        write_usage_summary(&build_usage_summary(usage, pricing), &mut stderr)?;
+    }
+    Ok(())
 }
 
 enum StreamOutput {
@@ -528,6 +605,7 @@ fn write_stream_bytes<W: Write>(
     bytes: &[u8],
     out: &mut W,
     output: &mut StreamOutput,
+    usage: &mut Option<Usage>,
 ) -> Result<bool> {
     pending.extend_from_slice(bytes);
 
@@ -536,7 +614,7 @@ fn write_stream_bytes<W: Write>(
         if line.last() == Some(&b'\n') {
             line.pop();
         }
-        if write_stream_line(&line, out, output)? {
+        if write_stream_line(&line, out, output, usage)? {
             return Ok(true);
         }
     }
@@ -548,8 +626,9 @@ fn finish_stream<W: Write>(
     pending: &mut Vec<u8>,
     out: &mut W,
     output: &mut StreamOutput,
+    usage: &mut Option<Usage>,
 ) -> Result<()> {
-    if !pending.is_empty() && write_stream_line(pending, out, output)? {
+    if !pending.is_empty() && write_stream_line(pending, out, output, usage)? {
         pending.clear();
         return output.finish(out);
     }
@@ -561,10 +640,19 @@ fn write_stream_line<W: Write>(
     line: &[u8],
     out: &mut W,
     output: &mut StreamOutput,
+    usage: &mut Option<Usage>,
 ) -> Result<bool> {
     match parse_stream_event(line) {
-        StreamEvent::Text(text) => {
-            output.write_text(&text, out)?;
+        StreamEvent::Chunk {
+            text,
+            usage: chunk_usage,
+        } => {
+            if let Some(chunk_usage) = chunk_usage {
+                *usage = Some(chunk_usage);
+            }
+            if !text.is_empty() {
+                output.write_text(&text, out)?;
+            }
             Ok(false)
         }
         StreamEvent::Done => Ok(true),
@@ -574,7 +662,7 @@ fn write_stream_line<W: Write>(
 
 #[derive(Debug, PartialEq, Eq)]
 enum StreamEvent {
-    Text(String),
+    Chunk { text: String, usage: Option<Usage> },
     Done,
     Ignore,
 }
@@ -602,10 +690,13 @@ fn parse_stream_event(line: &[u8]) -> StreamEvent {
         }
     }
 
-    if text.is_empty() {
+    if text.is_empty() && parsed.usage.is_none() {
         StreamEvent::Ignore
     } else {
-        StreamEvent::Text(text)
+        StreamEvent::Chunk {
+            text,
+            usage: parsed.usage,
+        }
     }
 }
 
@@ -932,6 +1023,114 @@ mod tests {
     }
 
     #[test]
+    fn usage_summary_writes_tokens_and_cost() {
+        let summary = build_usage_summary(
+            Usage {
+                prompt_tokens: 1_000,
+                completion_tokens: 500,
+            },
+            Some(ModelPricing {
+                input_per_1m: Some(1.0),
+                output_per_1m: Some(2.0),
+            }),
+        );
+        let mut out = Vec::new();
+
+        write_usage_summary(&summary, &mut out).unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "tokens: 1000 in / 500 out, ~$0.002\n"
+        );
+    }
+
+    #[test]
+    fn usage_summary_omits_cost_without_complete_pricing() {
+        let summary = build_usage_summary(
+            Usage {
+                prompt_tokens: 1_000,
+                completion_tokens: 500,
+            },
+            Some(ModelPricing {
+                input_per_1m: Some(1.0),
+                output_per_1m: None,
+            }),
+        );
+        let mut out = Vec::new();
+
+        write_usage_summary(&summary, &mut out).unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "tokens: 1000 in / 500 out\n"
+        );
+    }
+
+    #[test]
+    fn streaming_request_includes_usage_options() {
+        let request = ChatRequest {
+            model: "gpt-4.1-mini".to_string(),
+            messages: Vec::new(),
+            stream: true,
+            stream_options: Some(StreamOptions {
+                include_usage: true,
+            }),
+        };
+
+        let value = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(value["stream_options"]["include_usage"], true);
+    }
+
+    #[test]
+    fn non_streaming_request_omits_usage_options() {
+        let request = ChatRequest {
+            model: "gpt-4.1-mini".to_string(),
+            messages: Vec::new(),
+            stream: false,
+            stream_options: None,
+        };
+
+        let value = serde_json::to_value(&request).unwrap();
+
+        assert!(value.get("stream_options").is_none());
+    }
+
+    #[test]
+    fn config_serializes_pricing_table() {
+        let mut config = Config::default();
+        config.pricing.insert(
+            "gpt-4.1-mini".to_string(),
+            ModelPricing {
+                input_per_1m: Some(0.4),
+                output_per_1m: Some(1.6),
+            },
+        );
+
+        let text = toml::to_string_pretty(&config).unwrap();
+
+        assert!(text.contains("[pricing.\"gpt-4.1-mini\"]"));
+        assert!(text.contains("input_per_1m = 0.4"));
+        assert!(text.contains("output_per_1m = 1.6"));
+    }
+
+    #[test]
+    fn config_reads_pricing_table() {
+        let config: Config = toml::from_str(
+            r#"
+[pricing."gpt-4.1-mini"]
+input_per_1m = 0.4
+output_per_1m = 1.6
+"#,
+        )
+        .unwrap();
+
+        let pricing = config.pricing.get("gpt-4.1-mini").unwrap();
+        assert_eq!(pricing.input_per_1m, Some(0.4));
+        assert_eq!(pricing.output_per_1m, Some(1.6));
+    }
+
+    #[test]
     fn search_provider_notice_writes_to_given_output() {
         let mut out = Vec::new();
 
@@ -1096,6 +1295,7 @@ mod tests {
             exa_api_key: None,
             brave_api_key: None,
             profiles: BTreeMap::new(),
+            pricing: BTreeMap::new(),
         };
 
         apply_config_update(
@@ -1217,6 +1417,7 @@ mod tests {
             exa_api_key: None,
             brave_api_key: None,
             profiles: BTreeMap::new(),
+            pricing: BTreeMap::new(),
         };
         config.profiles.insert(
             "local".to_string(),
@@ -1316,6 +1517,7 @@ api_key = "local"
             exa_api_key: Some("exa-key".to_string()),
             brave_api_key: Some("brave-key".to_string()),
             profiles: BTreeMap::new(),
+            pricing: BTreeMap::new(),
         })
         .unwrap();
 
@@ -1429,13 +1631,15 @@ brave_api_key = "brave-key"
         let mut pending = Vec::new();
         let mut out = Vec::new();
         let mut output = StreamOutput::new(false);
+        let mut usage = None;
 
         assert!(
             !write_stream_bytes(
                 &mut pending,
                 &bytes[..split_inside_token],
                 &mut out,
-                &mut output
+                &mut output,
+                &mut usage,
             )
             .unwrap()
         );
@@ -1445,7 +1649,8 @@ brave_api_key = "brave-key"
                 &mut pending,
                 &bytes[split_inside_token..],
                 &mut out,
-                &mut output
+                &mut output,
+                &mut usage,
             )
             .unwrap()
         );
@@ -1462,12 +1667,27 @@ brave_api_key = "brave-key"
         let mut pending = Vec::new();
         let mut out = Vec::new();
         let mut output = StreamOutput::new(false);
+        let mut usage = None;
 
         assert!(
-            !write_stream_bytes(&mut pending, event.as_bytes(), &mut out, &mut output).unwrap()
+            !write_stream_bytes(
+                &mut pending,
+                event.as_bytes(),
+                &mut out,
+                &mut output,
+                &mut usage,
+            )
+            .unwrap()
         );
         assert!(
-            write_stream_bytes(&mut pending, b"data: [DONE]\n", &mut out, &mut output).unwrap()
+            write_stream_bytes(
+                &mut pending,
+                b"data: [DONE]\n",
+                &mut out,
+                &mut output,
+                &mut usage,
+            )
+            .unwrap()
         );
         output.finish(&mut out).unwrap();
 
@@ -1483,17 +1703,108 @@ brave_api_key = "brave-key"
         let mut pending = Vec::new();
         let mut out = Vec::new();
         let mut output = StreamOutput::new(true);
+        let mut usage = None;
 
         assert!(
-            !write_stream_bytes(&mut pending, event.as_bytes(), &mut out, &mut output).unwrap()
+            !write_stream_bytes(
+                &mut pending,
+                event.as_bytes(),
+                &mut out,
+                &mut output,
+                &mut usage,
+            )
+            .unwrap()
         );
         assert!(out.is_empty());
         assert!(
-            write_stream_bytes(&mut pending, b"data: [DONE]\n", &mut out, &mut output).unwrap()
+            write_stream_bytes(
+                &mut pending,
+                b"data: [DONE]\n",
+                &mut out,
+                &mut output,
+                &mut usage,
+            )
+            .unwrap()
         );
         output.finish(&mut out).unwrap();
 
         assert!(String::from_utf8(out).unwrap().contains("Title"));
+    }
+
+    #[test]
+    fn stream_usage_chunk_updates_usage_without_stdout() {
+        let event = format!(
+            "data: {}\n",
+            serde_json::json!({
+                "choices": [],
+                "usage": {
+                    "prompt_tokens": 1234,
+                    "completion_tokens": 567,
+                }
+            })
+        );
+        let mut pending = Vec::new();
+        let mut out = Vec::new();
+        let mut output = StreamOutput::new(false);
+        let mut usage = None;
+
+        assert!(
+            !write_stream_bytes(
+                &mut pending,
+                event.as_bytes(),
+                &mut out,
+                &mut output,
+                &mut usage,
+            )
+            .unwrap()
+        );
+
+        assert!(out.is_empty());
+        assert_eq!(
+            usage,
+            Some(Usage {
+                prompt_tokens: 1234,
+                completion_tokens: 567,
+            })
+        );
+    }
+
+    #[test]
+    fn stream_chunk_can_include_text_and_usage() {
+        let event = format!(
+            "data: {}\n",
+            serde_json::json!({
+                "choices": [{ "delta": { "content": "hello" } }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                }
+            })
+        );
+        let mut pending = Vec::new();
+        let mut out = Vec::new();
+        let mut output = StreamOutput::new(false);
+        let mut usage = None;
+
+        assert!(
+            !write_stream_bytes(
+                &mut pending,
+                event.as_bytes(),
+                &mut out,
+                &mut output,
+                &mut usage,
+            )
+            .unwrap()
+        );
+
+        assert_eq!(String::from_utf8(out).unwrap(), "hello");
+        assert_eq!(
+            usage,
+            Some(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 2,
+            })
+        );
     }
 
     #[test]
@@ -1505,11 +1816,19 @@ brave_api_key = "brave-key"
         let mut pending = Vec::new();
         let mut out = Vec::new();
         let mut output = StreamOutput::new(false);
+        let mut usage = None;
 
         assert!(
-            !write_stream_bytes(&mut pending, event.as_bytes(), &mut out, &mut output).unwrap()
+            !write_stream_bytes(
+                &mut pending,
+                event.as_bytes(),
+                &mut out,
+                &mut output,
+                &mut usage,
+            )
+            .unwrap()
         );
-        finish_stream(&mut pending, &mut out, &mut output).unwrap();
+        finish_stream(&mut pending, &mut out, &mut output, &mut usage).unwrap();
 
         assert_eq!(String::from_utf8(out).unwrap(), "last\n");
     }

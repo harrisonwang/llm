@@ -61,6 +61,14 @@ api_key = "local"
 ~/.llm/config.toml
 ```
 
+如果要显示估算费用，可以在配置文件里手动加入按每 1M token 计价的模型价格：
+
+```toml
+[pricing."gpt-4.1-mini"]
+input_per_1m = 0.4
+output_per_1m = 1.6
+```
+
 首次配置模型调用至少需要 `--base-url` 和 `--model`。配置完整后，可以单独更新某一项；命名 profile 同样适用：
 
 ```bash
@@ -136,6 +144,8 @@ cargo -V | llm --search "这个版本的cargo有什么特性？"
 ```
 
 启用 `--search` 时会在 stderr 输出实际使用的 provider，例如 `search provider: exa`；stdout 仍只输出模型回答，方便继续管道处理。
+
+模型返回 usage 时会在 stderr 输出 token 用量，例如 `tokens: 1234 in / 567 out`；如果配置了对应模型的 `[pricing.<model>]`，会追加估算费用，例如 `tokens: 1234 in / 567 out, ~$0.002`。stdout 始终只输出模型回答。
 
 默认使用 streaming。stdout 是 TTY 时会渲染 Markdown；stdout 被 pipe 或重定向时保持 raw Markdown，方便继续给其他工具处理。需要在终端里强制 raw 输出时：
 
