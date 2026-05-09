@@ -29,6 +29,8 @@ const HELP_TEMPLATE: &str = "\
   llm \"Explain TCP three-way handshake\"
   llm -m gpt-4.1-mini \"Summarize this\"
   llm -p local \"Draft quickly\"
+  llm models
+  llm models -p talkweb
   llm --no-render \"Write markdown\"
   cat report.md | llm \"Summarize risks and action items\"
   EXA_API_KEY=... llm --search \"Rust 2026 edition changes\"{after-help}";
@@ -173,6 +175,25 @@ enum Command {
         #[arg(long, value_name = "api-key")]
         brave_api_key: Option<String>,
     },
+
+    /// 列出 /models 返回的模型。
+    #[command(
+        help_template = COMMAND_HELP_TEMPLATE,
+        override_usage = "llm models [OPTIONS]"
+    )]
+    Models {
+        /// 使用命名 profile；不传则使用默认配置。
+        #[arg(short = 'p', long, value_name = "profile")]
+        profile: Option<String>,
+
+        /// provider API base URL。
+        #[arg(long, env = "LLM_BASE_URL", hide_env = true, value_name = "base-url")]
+        base_url: Option<String>,
+
+        /// API key；覆盖配置文件和 env: LLM_API_KEY。
+        #[arg(long, env = "LLM_API_KEY", hide_env = true, value_name = "api-key")]
+        api_key: Option<String>,
+    },
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -214,6 +235,16 @@ struct StreamOptions {
 struct Message {
     role: String,
     content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelsResponse {
+    data: Vec<ModelInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ModelInfo {
+    id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,6 +327,11 @@ async fn run() -> Result<()> {
                 exa_api_key,
                 brave_api_key,
             ),
+            Command::Models {
+                profile,
+                base_url,
+                api_key,
+            } => list_models_command(profile, base_url, api_key).await,
         };
     }
 
@@ -389,6 +425,51 @@ fn selected_model_config(config: &Config, profile: Option<String>) -> Result<Pro
         model: config.model.clone(),
         api_key: config.api_key.clone(),
     })
+}
+
+async fn list_models_command(
+    profile: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+) -> Result<()> {
+    let config = read_config()?;
+    let selected_config = selected_model_config(&config, profile)?;
+    let base_url =
+        first(base_url, selected_config.base_url, "LLM_BASE_URL", None).ok_or_else(|| {
+            anyhow!("missing base URL; run `llm config --base-url URL` or set LLM_BASE_URL")
+        })?;
+    let api_key = first(
+        api_key,
+        selected_config.api_key,
+        "LLM_API_KEY",
+        Some("EMPTY".to_string()),
+    )
+    .unwrap();
+    let models = fetch_models(&base_url, &api_key).await?;
+    let mut stdout = io::stdout();
+    write_models(&models, &mut stdout)
+}
+
+async fn fetch_models(base_url: &str, api_key: &str) -> Result<Vec<ModelInfo>> {
+    let response: ModelsResponse = client(api_key)
+        .get(models_url(base_url))
+        .send()
+        .await
+        .context("request failed")?
+        .error_for_status()
+        .context("provider returned an error")?
+        .json()
+        .await
+        .context("failed to parse models JSON")?;
+
+    Ok(response.data)
+}
+
+fn write_models<W: Write>(models: &[ModelInfo], out: &mut W) -> Result<()> {
+    for model in models {
+        writeln!(out, "{}", model.id).context("failed to write model list")?;
+    }
+    Ok(())
 }
 
 fn first(
@@ -730,6 +811,10 @@ fn client(api_key: &str) -> reqwest::Client {
 
 fn chat_url(base_url: &str) -> String {
     format!("{}/chat/completions", base_url.trim_end_matches('/'))
+}
+
+fn models_url(base_url: &str) -> String {
+    format!("{}/models", base_url.trim_end_matches('/'))
 }
 
 fn read_config() -> Result<Config> {
@@ -1128,6 +1213,57 @@ output_per_1m = 1.6
         let pricing = config.pricing.get("gpt-4.1-mini").unwrap();
         assert_eq!(pricing.input_per_1m, Some(0.4));
         assert_eq!(pricing.output_per_1m, Some(1.6));
+    }
+
+    #[test]
+    fn models_url_appends_models_endpoint() {
+        assert_eq!(
+            models_url("http://localhost:11434/v1/"),
+            "http://localhost:11434/v1/models"
+        );
+    }
+
+    #[test]
+    fn write_models_outputs_one_model_id_per_line() {
+        let models = vec![
+            ModelInfo {
+                id: "gpt-5.5".to_string(),
+            },
+            ModelInfo {
+                id: "tw/gpu/qwen2.5-vl-32b-instruct".to_string(),
+            },
+        ];
+        let mut out = Vec::new();
+
+        write_models(&models, &mut out).unwrap();
+
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "gpt-5.5\ntw/gpu/qwen2.5-vl-32b-instruct\n"
+        );
+    }
+
+    #[test]
+    fn models_response_reads_openai_compatible_shape() {
+        let response: ModelsResponse = serde_json::from_str(
+            r#"
+{
+  "object": "list",
+  "data": [
+    {
+      "id": "gpt-5.5",
+      "object": "model",
+      "created": 1626777600,
+      "owned_by": "custom",
+      "supported_endpoint_types": ["openai"]
+    }
+  ]
+}
+"#,
+        )
+        .unwrap();
+
+        assert_eq!(response.data[0].id, "gpt-5.5");
     }
 
     #[test]

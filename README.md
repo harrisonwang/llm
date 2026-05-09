@@ -112,6 +112,8 @@ llm --search-provider brave --search "Rust 2026 edition 最新变化"
 ```bash
 llm "写三条产品发布文案"
 llm -p local "草稿性问题，便宜又快"
+llm models
+llm models -p talkweb
 llm --no-render "输出原始 markdown"
 llm -m gpt-4.1-mini "解释 TCP 三次握手"
 llm -s "你是严谨的代码审查员" "审查这段代码"
@@ -129,6 +131,14 @@ pith report.pdf | llm --stream "总结这份报告，列出风险和行动项"
 
 ```bash
 echo "解释一下 transformer attention" | llm
+```
+
+列出当前 OpenAI-compatible endpoint 支持的模型：
+
+```bash
+llm models
+llm models -p talkweb
+llm models --base-url http://localhost:11434/v1 --api-key local
 ```
 
 网页内容抓取继续通过其他 CLI 组合：
