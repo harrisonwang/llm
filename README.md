@@ -104,6 +104,7 @@ llm --search-provider brave --search "Rust 2026 edition 最新变化"
 ```bash
 llm "写三条产品发布文案"
 llm -p local "草稿性问题，便宜又快"
+llm --no-render "输出原始 markdown"
 llm -m gpt-4.1-mini "解释 TCP 三次握手"
 llm -s "你是严谨的代码审查员" "审查这段代码"
 llm --search "Rust 2026 edition 最新变化"
@@ -136,7 +137,13 @@ cargo -V | llm --search "这个版本的cargo有什么特性？"
 
 启用 `--search` 时会在 stderr 输出实际使用的 provider，例如 `search provider: exa`；stdout 仍只输出模型回答，方便继续管道处理。
 
-默认使用 streaming。需要等待完整响应时：
+默认使用 streaming。stdout 是 TTY 时会渲染 Markdown；stdout 被 pipe 或重定向时保持 raw Markdown，方便继续给其他工具处理。需要在终端里强制 raw 输出时：
+
+```bash
+llm --no-render "hello"
+```
+
+需要等待完整响应时：
 
 ```bash
 llm --stream "hello"

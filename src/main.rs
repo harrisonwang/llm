@@ -29,6 +29,7 @@ const HELP_TEMPLATE: &str = "\
   llm \"Explain TCP three-way handshake\"
   llm -m gpt-4.1-mini \"Summarize this\"
   llm -p local \"Draft quickly\"
+  llm --no-render \"Write markdown\"
   cat report.md | llm \"Summarize risks and action items\"
   EXA_API_KEY=... llm --search \"Rust 2026 edition changes\"{after-help}";
 
@@ -119,6 +120,10 @@ struct Cli {
     /// 关闭 streaming，等待完整响应后输出。
     #[arg(long)]
     no_stream: bool,
+
+    /// 关闭 TTY Markdown 渲染，始终输出原始文本。
+    #[arg(long)]
+    no_render: bool,
 
     /// 显示帮助。
     #[arg(short = 'h', long = "help", action = ArgAction::Help, global = true)]
@@ -328,10 +333,11 @@ async fn run() -> Result<()> {
         stream,
     };
 
+    let render = should_render(cli.no_render);
     if request.stream {
-        stream_chat(&base_url, &api_key, &request).await
+        stream_chat(&base_url, &api_key, &request, render).await
     } else {
-        complete_chat(&base_url, &api_key, &request).await
+        complete_chat(&base_url, &api_key, &request, render).await
     }
 }
 
@@ -394,6 +400,26 @@ fn write_search_provider_notice<W: Write>(provider: SearchProvider, out: &mut W)
     writeln!(out, "search provider: {provider}").context("failed to write search provider notice")
 }
 
+fn should_render(no_render: bool) -> bool {
+    should_render_for(no_render, io::stdout().is_terminal())
+}
+
+fn should_render_for(no_render: bool, stdout_is_tty: bool) -> bool {
+    !no_render && stdout_is_tty
+}
+
+fn write_markdown_output<W: Write>(text: &str, render: bool, out: &mut W) -> Result<()> {
+    if render {
+        termimad::MadSkin::default()
+            .write_text_on(out, text)
+            .context("failed to render markdown output")?;
+        writeln!(out).context("failed to write final newline")?;
+    } else {
+        writeln!(out, "{text}").context("failed to write output")?;
+    }
+    Ok(())
+}
+
 fn read_stdin_if_piped() -> Result<Option<String>> {
     if io::stdin().is_terminal() {
         return Ok(None);
@@ -409,7 +435,12 @@ fn read_stdin_if_piped() -> Result<Option<String>> {
     }
 }
 
-async fn complete_chat(base_url: &str, api_key: &str, request: &ChatRequest) -> Result<()> {
+async fn complete_chat(
+    base_url: &str,
+    api_key: &str,
+    request: &ChatRequest,
+    render: bool,
+) -> Result<()> {
     let response: ChatResponse = client(api_key)
         .post(chat_url(base_url))
         .json(request)
@@ -427,11 +458,16 @@ async fn complete_chat(base_url: &str, api_key: &str, request: &ChatRequest) -> 
         .first()
         .and_then(|choice| choice.message.content.as_deref())
         .unwrap_or("");
-    println!("{text}");
-    Ok(())
+    let mut stdout = io::stdout();
+    write_markdown_output(text, render, &mut stdout)
 }
 
-async fn stream_chat(base_url: &str, api_key: &str, request: &ChatRequest) -> Result<()> {
+async fn stream_chat(
+    base_url: &str,
+    api_key: &str,
+    request: &ChatRequest,
+    render: bool,
+) -> Result<()> {
     let mut response = client(api_key)
         .post(chat_url(base_url))
         .json(request)
@@ -443,16 +479,56 @@ async fn stream_chat(base_url: &str, api_key: &str, request: &ChatRequest) -> Re
 
     let mut stdout = io::stdout();
     let mut pending = Vec::new();
+    let mut output = StreamOutput::new(render);
     while let Some(chunk) = response.chunk().await.context("failed to read stream")? {
-        if write_stream_bytes(&mut pending, &chunk, &mut stdout)? {
-            return Ok(());
+        if write_stream_bytes(&mut pending, &chunk, &mut stdout, &mut output)? {
+            return output.finish(&mut stdout);
         }
     }
-    finish_stream(&mut pending, &mut stdout)?;
-    Ok(())
+    finish_stream(&mut pending, &mut stdout, &mut output)
 }
 
-fn write_stream_bytes<W: Write>(pending: &mut Vec<u8>, bytes: &[u8], out: &mut W) -> Result<bool> {
+enum StreamOutput {
+    Raw,
+    Rendered(String),
+}
+
+impl StreamOutput {
+    fn new(render: bool) -> Self {
+        if render {
+            Self::Rendered(String::new())
+        } else {
+            Self::Raw
+        }
+    }
+
+    fn write_text<W: Write>(&mut self, text: &str, out: &mut W) -> Result<()> {
+        match self {
+            Self::Raw => {
+                out.write_all(text.as_bytes())
+                    .context("failed to write streamed output")?;
+                out.flush().context("failed to flush streamed output")?;
+            }
+            Self::Rendered(buffer) => buffer.push_str(text),
+        }
+        Ok(())
+    }
+
+    fn finish<W: Write>(&mut self, out: &mut W) -> Result<()> {
+        match self {
+            Self::Raw => writeln!(out).context("failed to write final newline")?,
+            Self::Rendered(buffer) => write_markdown_output(buffer, true, out)?,
+        }
+        Ok(())
+    }
+}
+
+fn write_stream_bytes<W: Write>(
+    pending: &mut Vec<u8>,
+    bytes: &[u8],
+    out: &mut W,
+    output: &mut StreamOutput,
+) -> Result<bool> {
     pending.extend_from_slice(bytes);
 
     while let Some(pos) = pending.iter().position(|byte| *byte == b'\n') {
@@ -460,7 +536,7 @@ fn write_stream_bytes<W: Write>(pending: &mut Vec<u8>, bytes: &[u8], out: &mut W
         if line.last() == Some(&b'\n') {
             line.pop();
         }
-        if write_stream_line(&line, out)? {
+        if write_stream_line(&line, out, output)? {
             return Ok(true);
         }
     }
@@ -468,28 +544,30 @@ fn write_stream_bytes<W: Write>(pending: &mut Vec<u8>, bytes: &[u8], out: &mut W
     Ok(false)
 }
 
-fn finish_stream<W: Write>(pending: &mut Vec<u8>, out: &mut W) -> Result<()> {
-    if !pending.is_empty() && write_stream_line(pending, out)? {
+fn finish_stream<W: Write>(
+    pending: &mut Vec<u8>,
+    out: &mut W,
+    output: &mut StreamOutput,
+) -> Result<()> {
+    if !pending.is_empty() && write_stream_line(pending, out, output)? {
         pending.clear();
-        return Ok(());
+        return output.finish(out);
     }
     pending.clear();
-    writeln!(out).context("failed to write final newline")?;
-    Ok(())
+    output.finish(out)
 }
 
-fn write_stream_line<W: Write>(line: &[u8], out: &mut W) -> Result<bool> {
+fn write_stream_line<W: Write>(
+    line: &[u8],
+    out: &mut W,
+    output: &mut StreamOutput,
+) -> Result<bool> {
     match parse_stream_event(line) {
         StreamEvent::Text(text) => {
-            out.write_all(text.as_bytes())
-                .context("failed to write streamed output")?;
-            out.flush().context("failed to flush streamed output")?;
+            output.write_text(&text, out)?;
             Ok(false)
         }
-        StreamEvent::Done => {
-            writeln!(out).context("failed to write final newline")?;
-            Ok(true)
-        }
+        StreamEvent::Done => Ok(true),
         StreamEvent::Ignore => Ok(false),
     }
 }
@@ -816,6 +894,41 @@ mod tests {
         assert_eq!(base_url.as_deref(), Some("http://localhost:11434/v1"));
         assert_eq!(model.as_deref(), Some("llama3.2"));
         assert_eq!(api_key.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn no_render_flag_parses() {
+        let cli = Cli::try_parse_from(["llm", "--no-render", "hi"]).unwrap();
+
+        assert!(cli.no_render);
+        assert_eq!(cli.prompt, ["hi"]);
+    }
+
+    #[test]
+    fn should_render_only_for_tty_without_override() {
+        assert!(should_render_for(false, true));
+        assert!(!should_render_for(false, false));
+        assert!(!should_render_for(true, true));
+        assert!(!should_render_for(true, false));
+    }
+
+    #[test]
+    fn raw_markdown_output_preserves_text() {
+        let mut out = Vec::new();
+
+        write_markdown_output("## Title\n\n**bold**", false, &mut out).unwrap();
+
+        assert_eq!(String::from_utf8(out).unwrap(), "## Title\n\n**bold**\n");
+    }
+
+    #[test]
+    fn rendered_markdown_output_writes_terminal_text() {
+        let mut out = Vec::new();
+
+        write_markdown_output("## Title", true, &mut out).unwrap();
+
+        assert!(!out.is_empty());
+        assert!(String::from_utf8(out).unwrap().contains("Title"));
     }
 
     #[test]
@@ -1250,9 +1363,11 @@ brave_api_key = "brave-key"
         assert!(help.contains("--api-key <api-key>"));
         assert!(help.contains("--search-provider <provider>"));
         assert!(help.contains("--exa-api-key <api-key>"));
+        assert!(help.contains("--no-render"));
         assert!(help.contains("--system <system-prompt>"));
         assert!(help.contains("示例 (Examples):"));
         assert!(help.contains("llm -p local \"Draft quickly\""));
+        assert!(help.contains("llm --no-render \"Write markdown\""));
         assert!(help.contains("cat report.md | llm \"Summarize risks and action items\""));
         assert!(help.contains("显示帮助。"));
         assert!(!help.contains("提示词"));
@@ -1313,10 +1428,27 @@ brave_api_key = "brave-key"
 
         let mut pending = Vec::new();
         let mut out = Vec::new();
+        let mut output = StreamOutput::new(false);
 
-        assert!(!write_stream_bytes(&mut pending, &bytes[..split_inside_token], &mut out).unwrap());
+        assert!(
+            !write_stream_bytes(
+                &mut pending,
+                &bytes[..split_inside_token],
+                &mut out,
+                &mut output
+            )
+            .unwrap()
+        );
         assert!(out.is_empty());
-        assert!(!write_stream_bytes(&mut pending, &bytes[split_inside_token..], &mut out).unwrap());
+        assert!(
+            !write_stream_bytes(
+                &mut pending,
+                &bytes[split_inside_token..],
+                &mut out,
+                &mut output
+            )
+            .unwrap()
+        );
 
         assert_eq!(String::from_utf8(out).unwrap(), token);
     }
@@ -1329,11 +1461,39 @@ brave_api_key = "brave-key"
         );
         let mut pending = Vec::new();
         let mut out = Vec::new();
+        let mut output = StreamOutput::new(false);
 
-        assert!(!write_stream_bytes(&mut pending, event.as_bytes(), &mut out).unwrap());
-        assert!(write_stream_bytes(&mut pending, b"data: [DONE]\n", &mut out).unwrap());
+        assert!(
+            !write_stream_bytes(&mut pending, event.as_bytes(), &mut out, &mut output).unwrap()
+        );
+        assert!(
+            write_stream_bytes(&mut pending, b"data: [DONE]\n", &mut out, &mut output).unwrap()
+        );
+        output.finish(&mut out).unwrap();
 
         assert_eq!(String::from_utf8(out).unwrap(), "hello\n");
+    }
+
+    #[test]
+    fn rendered_stream_buffers_until_done() {
+        let event = format!(
+            "data: {}\n",
+            serde_json::json!({ "choices": [{ "delta": { "content": "## Title" } }] })
+        );
+        let mut pending = Vec::new();
+        let mut out = Vec::new();
+        let mut output = StreamOutput::new(true);
+
+        assert!(
+            !write_stream_bytes(&mut pending, event.as_bytes(), &mut out, &mut output).unwrap()
+        );
+        assert!(out.is_empty());
+        assert!(
+            write_stream_bytes(&mut pending, b"data: [DONE]\n", &mut out, &mut output).unwrap()
+        );
+        output.finish(&mut out).unwrap();
+
+        assert!(String::from_utf8(out).unwrap().contains("Title"));
     }
 
     #[test]
@@ -1344,9 +1504,12 @@ brave_api_key = "brave-key"
         );
         let mut pending = Vec::new();
         let mut out = Vec::new();
+        let mut output = StreamOutput::new(false);
 
-        assert!(!write_stream_bytes(&mut pending, event.as_bytes(), &mut out).unwrap());
-        finish_stream(&mut pending, &mut out).unwrap();
+        assert!(
+            !write_stream_bytes(&mut pending, event.as_bytes(), &mut out, &mut output).unwrap()
+        );
+        finish_stream(&mut pending, &mut out, &mut output).unwrap();
 
         assert_eq!(String::from_utf8(out).unwrap(), "last\n");
     }
