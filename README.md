@@ -34,18 +34,40 @@ llm config \
   --api-key local
 ```
 
+也可以配置命名 profile，并在运行时用 `-p/--profile` 选择；不传 `-p` 时继续使用上面的默认配置：
+
+```bash
+llm config --profile deepseek --base-url https://api.deepseek.com/v1 --model deepseek-v4 --api-key "$DEEPSEEK_API_KEY"
+llm config --profile local --base-url http://localhost:11434/v1 --model llama3.2 --api-key local
+llm config --profile openai --base-url https://api.openai.com/v1 --model gpt-4.1-mini --api-key "$OPENAI_API_KEY"
+
+llm -p local "草稿性问题，便宜又快"
+llm -p deepseek "写代码"
+llm "默认 profile"
+```
+
+命名 profile 会写入：
+
+```toml
+[profiles.local]
+base_url = "http://localhost:11434/v1"
+model = "llama3.2"
+api_key = "local"
+```
+
 配置文件位置：
 
 ```text
 ~/.llm/config.toml
 ```
 
-首次配置模型调用至少需要 `--base-url` 和 `--model`。配置完整后，可以单独更新某一项：
+首次配置模型调用至少需要 `--base-url` 和 `--model`。配置完整后，可以单独更新某一项；命名 profile 同样适用：
 
 ```bash
 llm config --model deepseek-v4
 llm config --base-url https://api.deepseek.com/v1
 llm config --api-key "$DEEPSEEK_API_KEY"
+llm config --profile local --model llama3.3
 llm config --search-provider exa
 llm config --exa-api-key "$EXA_API_KEY"
 llm config --brave-api-key "$BRAVE_SEARCH_API_KEY"
@@ -81,6 +103,7 @@ llm --search-provider brave --search "Rust 2026 edition 最新变化"
 
 ```bash
 llm "写三条产品发布文案"
+llm -p local "草稿性问题，便宜又快"
 llm -m gpt-4.1-mini "解释 TCP 三次握手"
 llm -s "你是严谨的代码审查员" "审查这段代码"
 llm --search "Rust 2026 edition 最新变化"

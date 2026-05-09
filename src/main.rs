@@ -3,6 +3,7 @@ use clap::{ArgAction, Parser, Subcommand};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE, HeaderMap, HeaderValue};
 use search::SearchProvider;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
@@ -27,6 +28,7 @@ const HELP_TEMPLATE: &str = "\
 示例 (Examples):
   llm \"Explain TCP three-way handshake\"
   llm -m gpt-4.1-mini \"Summarize this\"
+  llm -p local \"Draft quickly\"
   cat report.md | llm \"Summarize risks and action items\"
   EXA_API_KEY=... llm --search \"Rust 2026 edition changes\"{after-help}";
 
@@ -40,6 +42,7 @@ const COMMAND_HELP_TEMPLATE: &str = "\
 
 示例 (Examples):
   llm config --base-url https://api.openai.com/v1 --model gpt-4.1-mini
+  llm config --profile local --base-url http://localhost:11434/v1 --model llama3.2 --api-key local
   llm config --model deepseek-v4
   llm config --api-key \"$OPENAI_API_KEY\"
   llm config --search-provider exa
@@ -65,6 +68,10 @@ struct Cli {
     /// 使用的 model；覆盖配置文件和 env: LLM_MODEL。
     #[arg(short, long, env = "LLM_MODEL", hide_env = true, value_name = "model")]
     model: Option<String>,
+
+    /// 使用命名 profile；不传则使用默认配置。
+    #[arg(short = 'p', long, value_name = "profile")]
+    profile: Option<String>,
 
     /// provider API base URL；env: LLM_BASE_URL。
     #[arg(long, env = "LLM_BASE_URL", hide_env = true, value_name = "base-url")]
@@ -133,6 +140,10 @@ enum Command {
         override_usage = "llm config [OPTIONS]"
     )]
     Config {
+        /// 写入命名 profile；不传则写入默认配置。
+        #[arg(long, value_name = "profile")]
+        profile: Option<String>,
+
         /// provider API base URL。
         #[arg(long, value_name = "base-url")]
         base_url: Option<String>,
@@ -167,6 +178,15 @@ struct Config {
     search_provider: Option<SearchProvider>,
     exa_api_key: Option<String>,
     brave_api_key: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    profiles: BTreeMap<String, ProfileConfig>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct ProfileConfig {
+    base_url: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -226,6 +246,7 @@ async fn run() -> Result<()> {
     if let Some(command) = cli.command {
         return match command {
             Command::Config {
+                profile,
                 base_url,
                 model,
                 api_key,
@@ -233,6 +254,7 @@ async fn run() -> Result<()> {
                 exa_api_key,
                 brave_api_key,
             } => update_config(
+                profile,
                 base_url,
                 model,
                 api_key,
@@ -261,14 +283,16 @@ async fn run() -> Result<()> {
         None
     };
 
-    let base_url = first(cli.base_url, config.base_url, "LLM_BASE_URL", None).ok_or_else(|| {
-        anyhow!("missing base URL; run `llm config --base-url URL` or set LLM_BASE_URL")
-    })?;
-    let model = first(cli.model, config.model, "LLM_MODEL", None)
+    let selected_config = selected_model_config(&config, cli.profile)?;
+    let base_url =
+        first(cli.base_url, selected_config.base_url, "LLM_BASE_URL", None).ok_or_else(|| {
+            anyhow!("missing base URL; run `llm config --base-url URL` or set LLM_BASE_URL")
+        })?;
+    let model = first(cli.model, selected_config.model, "LLM_MODEL", None)
         .ok_or_else(|| anyhow!("missing model; run `llm config --model MODEL` or set LLM_MODEL"))?;
     let api_key = first(
         cli.api_key,
-        config.api_key,
+        selected_config.api_key,
         "LLM_API_KEY",
         Some("EMPTY".to_string()),
     )
@@ -309,6 +333,23 @@ async fn run() -> Result<()> {
     } else {
         complete_chat(&base_url, &api_key, &request).await
     }
+}
+
+fn selected_model_config(config: &Config, profile: Option<String>) -> Result<ProfileConfig> {
+    if let Some(profile) = profile {
+        let profile = validate_profile_name(&profile)?;
+        return config
+            .profiles
+            .get(&profile)
+            .cloned()
+            .ok_or_else(|| anyhow!("profile '{profile}' not found; run `llm config --profile {profile} --base-url URL --model MODEL`"));
+    }
+
+    Ok(ProfileConfig {
+        base_url: config.base_url.clone(),
+        model: config.model.clone(),
+        api_key: config.api_key.clone(),
+    })
 }
 
 fn first(
@@ -545,7 +586,19 @@ fn write_config(config: Config) -> Result<()> {
     Ok(())
 }
 
+#[derive(Default)]
+struct ConfigUpdate {
+    profile: Option<String>,
+    base_url: Option<String>,
+    model: Option<String>,
+    api_key: Option<String>,
+    search_provider: Option<SearchProvider>,
+    exa_api_key: Option<String>,
+    brave_api_key: Option<String>,
+}
+
 fn update_config(
+    profile: Option<String>,
     base_url: Option<String>,
     model: Option<String>,
     api_key: Option<String>,
@@ -556,25 +609,29 @@ fn update_config(
     let mut config = read_config()?;
     apply_config_update(
         &mut config,
+        ConfigUpdate {
+            profile,
+            base_url,
+            model,
+            api_key,
+            search_provider,
+            exa_api_key,
+            brave_api_key,
+        },
+    )?;
+    write_config(config)
+}
+
+fn apply_config_update(config: &mut Config, update: ConfigUpdate) -> Result<()> {
+    let ConfigUpdate {
+        profile,
         base_url,
         model,
         api_key,
         search_provider,
         exa_api_key,
         brave_api_key,
-    )?;
-    write_config(config)
-}
-
-fn apply_config_update(
-    config: &mut Config,
-    base_url: Option<String>,
-    model: Option<String>,
-    api_key: Option<String>,
-    search_provider: Option<SearchProvider>,
-    exa_api_key: Option<String>,
-    brave_api_key: Option<String>,
-) -> Result<()> {
+    } = update;
     if base_url.is_none()
         && model.is_none()
         && api_key.is_none()
@@ -588,6 +645,26 @@ fn apply_config_update(
     }
 
     let updates_model_config = base_url.is_some() || model.is_some() || api_key.is_some();
+    if let Some(profile) = profile {
+        if search_provider.is_some() || exa_api_key.is_some() || brave_api_key.is_some() {
+            return Err(anyhow!(
+                "--profile cannot be combined with search config; configure search provider globally"
+            ));
+        }
+        if !updates_model_config {
+            return Err(anyhow!(
+                "nothing to configure; pass at least one of --base-url, --model, --api-key"
+            ));
+        }
+        let profile = validate_profile_name(&profile)?;
+        let profile_config = config.profiles.entry(profile).or_default();
+        set_config_value(&mut profile_config.base_url, base_url, "--base-url")?;
+        set_config_value(&mut profile_config.model, model, "--model")?;
+        set_config_value(&mut profile_config.api_key, api_key, "--api-key")?;
+        ensure_profile_config_complete(profile_config)?;
+        return Ok(());
+    }
+
     set_config_value(&mut config.base_url, base_url, "--base-url")?;
     set_config_value(&mut config.model, model, "--model")?;
     set_config_value(&mut config.api_key, api_key, "--api-key")?;
@@ -602,6 +679,20 @@ fn apply_config_update(
     }
 
     Ok(())
+}
+
+fn validate_profile_name(profile: &str) -> Result<String> {
+    let profile = profile.trim();
+    if profile.is_empty()
+        || !profile
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err(anyhow!(
+            "invalid profile name; use letters, digits, '.', '_' or '-'"
+        ));
+    }
+    Ok(profile.to_string())
 }
 
 fn set_config_value(
@@ -620,8 +711,16 @@ fn set_config_value(
 }
 
 fn ensure_model_config_complete(config: &Config) -> Result<()> {
-    let missing_base_url = config_value_is_empty(config.base_url.as_deref());
-    let missing_model = config_value_is_empty(config.model.as_deref());
+    ensure_complete_model_fields(config.base_url.as_deref(), config.model.as_deref())
+}
+
+fn ensure_profile_config_complete(config: &ProfileConfig) -> Result<()> {
+    ensure_complete_model_fields(config.base_url.as_deref(), config.model.as_deref())
+}
+
+fn ensure_complete_model_fields(base_url: Option<&str>, model: Option<&str>) -> Result<()> {
+    let missing_base_url = config_value_is_empty(base_url);
+    let missing_model = config_value_is_empty(model);
     match (missing_base_url, missing_model) {
         (false, false) => Ok(()),
         (true, true) => Err(anyhow!(
@@ -677,6 +776,46 @@ mod tests {
 
         assert_eq!(cli.prompt, ["hi"]);
         assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn profile_flag_parses() {
+        let cli = Cli::try_parse_from(["llm", "-p", "local", "hi"]).unwrap();
+
+        assert_eq!(cli.profile.as_deref(), Some("local"));
+        assert_eq!(cli.prompt, ["hi"]);
+    }
+
+    #[test]
+    fn config_profile_flag_parses() {
+        let cli = Cli::try_parse_from([
+            "llm",
+            "config",
+            "--profile",
+            "local",
+            "--base-url",
+            "http://localhost:11434/v1",
+            "--model",
+            "llama3.2",
+            "--api-key",
+            "local",
+        ])
+        .unwrap();
+
+        let Some(Command::Config {
+            profile,
+            base_url,
+            model,
+            api_key,
+            ..
+        }) = cli.command
+        else {
+            panic!("expected config command");
+        };
+        assert_eq!(profile.as_deref(), Some("local"));
+        assert_eq!(base_url.as_deref(), Some("http://localhost:11434/v1"));
+        assert_eq!(model.as_deref(), Some("llama3.2"));
+        assert_eq!(api_key.as_deref(), Some("local"));
     }
 
     #[test]
@@ -752,7 +891,7 @@ mod tests {
     #[test]
     fn config_update_rejects_no_options() {
         let mut config = Config::default();
-        let err = apply_config_update(&mut config, None, None, None, None, None, None)
+        let err = apply_config_update(&mut config, ConfigUpdate::default())
             .unwrap_err()
             .to_string();
 
@@ -765,12 +904,10 @@ mod tests {
 
         apply_config_update(
             &mut config,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(" brave-key ".to_string()),
+            ConfigUpdate {
+                brave_api_key: Some(" brave-key ".to_string()),
+                ..ConfigUpdate::default()
+            },
         )
         .unwrap();
 
@@ -785,12 +922,11 @@ mod tests {
 
         apply_config_update(
             &mut config,
-            None,
-            None,
-            None,
-            Some(SearchProvider::Exa),
-            Some(" exa-key ".to_string()),
-            None,
+            ConfigUpdate {
+                search_provider: Some(SearchProvider::Exa),
+                exa_api_key: Some(" exa-key ".to_string()),
+                ..ConfigUpdate::default()
+            },
         )
         .unwrap();
 
@@ -805,12 +941,10 @@ mod tests {
         let mut config = Config::default();
         let err = apply_config_update(
             &mut config,
-            None,
-            Some("deepseek-v4".to_string()),
-            None,
-            None,
-            None,
-            None,
+            ConfigUpdate {
+                model: Some("deepseek-v4".to_string()),
+                ..ConfigUpdate::default()
+            },
         )
         .unwrap_err()
         .to_string();
@@ -824,12 +958,11 @@ mod tests {
 
         apply_config_update(
             &mut config,
-            Some(" https://api.deepseek.com/v1 ".to_string()),
-            Some(" deepseek-v4 ".to_string()),
-            None,
-            None,
-            None,
-            None,
+            ConfigUpdate {
+                base_url: Some(" https://api.deepseek.com/v1 ".to_string()),
+                model: Some(" deepseek-v4 ".to_string()),
+                ..ConfigUpdate::default()
+            },
         )
         .unwrap();
 
@@ -849,16 +982,15 @@ mod tests {
             search_provider: None,
             exa_api_key: None,
             brave_api_key: None,
+            profiles: BTreeMap::new(),
         };
 
         apply_config_update(
             &mut config,
-            None,
-            Some("deepseek-v4".to_string()),
-            None,
-            None,
-            None,
-            None,
+            ConfigUpdate {
+                model: Some("deepseek-v4".to_string()),
+                ..ConfigUpdate::default()
+            },
         )
         .unwrap();
 
@@ -868,6 +1000,189 @@ mod tests {
         );
         assert_eq!(config.model.as_deref(), Some("deepseek-v4"));
         assert_eq!(config.api_key.as_deref(), Some("old-key"));
+    }
+
+    #[test]
+    fn profile_update_creates_complete_profile() {
+        let mut config = Config::default();
+
+        apply_config_update(
+            &mut config,
+            ConfigUpdate {
+                profile: Some(" local ".to_string()),
+                base_url: Some(" http://localhost:11434/v1 ".to_string()),
+                model: Some(" llama3.2 ".to_string()),
+                api_key: Some(" local ".to_string()),
+                ..ConfigUpdate::default()
+            },
+        )
+        .unwrap();
+
+        let profile = config.profiles.get("local").unwrap();
+        assert_eq!(
+            profile.base_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+        assert_eq!(profile.model.as_deref(), Some("llama3.2"));
+        assert_eq!(profile.api_key.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn profile_update_rejects_incomplete_profile() {
+        let mut config = Config::default();
+        let err = apply_config_update(
+            &mut config,
+            ConfigUpdate {
+                profile: Some("local".to_string()),
+                model: Some("llama3.2".to_string()),
+                ..ConfigUpdate::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("requires --base-url"));
+    }
+
+    #[test]
+    fn profile_update_allows_single_model_change_after_complete_profile() {
+        let mut config = Config::default();
+        config.profiles.insert(
+            "local".to_string(),
+            ProfileConfig {
+                base_url: Some("http://localhost:11434/v1".to_string()),
+                model: Some("llama3.2".to_string()),
+                api_key: Some("local".to_string()),
+            },
+        );
+
+        apply_config_update(
+            &mut config,
+            ConfigUpdate {
+                profile: Some("local".to_string()),
+                model: Some("llama3.3".to_string()),
+                ..ConfigUpdate::default()
+            },
+        )
+        .unwrap();
+
+        let profile = config.profiles.get("local").unwrap();
+        assert_eq!(
+            profile.base_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+        assert_eq!(profile.model.as_deref(), Some("llama3.3"));
+        assert_eq!(profile.api_key.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn profile_update_rejects_search_config() {
+        let mut config = Config::default();
+        let err = apply_config_update(
+            &mut config,
+            ConfigUpdate {
+                profile: Some("local".to_string()),
+                base_url: Some("http://localhost:11434/v1".to_string()),
+                model: Some("llama3.2".to_string()),
+                search_provider: Some(SearchProvider::Exa),
+                ..ConfigUpdate::default()
+            },
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(err.contains("--profile cannot be combined with search config"));
+    }
+
+    #[test]
+    fn selected_profile_uses_named_config() {
+        let mut config = Config {
+            base_url: Some("https://api.openai.com/v1".to_string()),
+            model: Some("gpt-4.1-mini".to_string()),
+            api_key: Some("openai-key".to_string()),
+            search_provider: None,
+            exa_api_key: None,
+            brave_api_key: None,
+            profiles: BTreeMap::new(),
+        };
+        config.profiles.insert(
+            "local".to_string(),
+            ProfileConfig {
+                base_url: Some("http://localhost:11434/v1".to_string()),
+                model: Some("llama3.2".to_string()),
+                api_key: Some("local".to_string()),
+            },
+        );
+
+        let selected = selected_model_config(&config, Some("local".to_string())).unwrap();
+
+        assert_eq!(
+            selected.base_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+        assert_eq!(selected.model.as_deref(), Some("llama3.2"));
+        assert_eq!(selected.api_key.as_deref(), Some("local"));
+    }
+
+    #[test]
+    fn selected_profile_rejects_missing_profile() {
+        let config = Config::default();
+        let err = selected_model_config(&config, Some("missing".to_string()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("profile 'missing' not found"));
+    }
+
+    #[test]
+    fn selected_profile_rejects_invalid_profile_name() {
+        let config = Config::default();
+        let err = selected_model_config(&config, Some("bad/name".to_string()))
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.contains("invalid profile name"));
+    }
+
+    #[test]
+    fn config_serializes_profiles_table() {
+        let mut config = Config::default();
+        config.profiles.insert(
+            "local".to_string(),
+            ProfileConfig {
+                base_url: Some("http://localhost:11434/v1".to_string()),
+                model: Some("llama3.2".to_string()),
+                api_key: Some("local".to_string()),
+            },
+        );
+
+        let text = toml::to_string_pretty(&config).unwrap();
+
+        assert!(text.contains("[profiles.local]"));
+        assert!(text.contains("base_url = \"http://localhost:11434/v1\""));
+        assert!(text.contains("model = \"llama3.2\""));
+        assert!(text.contains("api_key = \"local\""));
+    }
+
+    #[test]
+    fn config_reads_profiles_table() {
+        let config: Config = toml::from_str(
+            r#"
+[profiles.local]
+base_url = "http://localhost:11434/v1"
+model = "llama3.2"
+api_key = "local"
+"#,
+        )
+        .unwrap();
+
+        let profile = config.profiles.get("local").unwrap();
+        assert_eq!(
+            profile.base_url.as_deref(),
+            Some("http://localhost:11434/v1")
+        );
+        assert_eq!(profile.model.as_deref(), Some("llama3.2"));
+        assert_eq!(profile.api_key.as_deref(), Some("local"));
     }
 
     #[test]
@@ -887,6 +1202,7 @@ mod tests {
             search_provider: Some(SearchProvider::Exa),
             exa_api_key: Some("exa-key".to_string()),
             brave_api_key: Some("brave-key".to_string()),
+            profiles: BTreeMap::new(),
         })
         .unwrap();
 
@@ -927,6 +1243,7 @@ brave_api_key = "brave-key"
         assert!(help.contains("参数 (Arguments):"));
         assert!(help.contains("选项 (Options):"));
         assert!(help.contains("--model <model>"));
+        assert!(help.contains("--profile <profile>"));
         assert!(help.contains("env: LLM_MODEL"));
         assert!(help.contains("--base-url <base-url>"));
         assert!(help.contains("provider API base URL"));
@@ -935,6 +1252,7 @@ brave_api_key = "brave-key"
         assert!(help.contains("--exa-api-key <api-key>"));
         assert!(help.contains("--system <system-prompt>"));
         assert!(help.contains("示例 (Examples):"));
+        assert!(help.contains("llm -p local \"Draft quickly\""));
         assert!(help.contains("cat report.md | llm \"Summarize risks and action items\""));
         assert!(help.contains("显示帮助。"));
         assert!(!help.contains("提示词"));
@@ -953,6 +1271,7 @@ brave_api_key = "brave-key"
         assert!(help.contains("写入配置文件。"));
         assert!(help.contains("用法 (Usage):"));
         assert!(help.contains("llm config [OPTIONS]"));
+        assert!(help.contains("--profile <profile>"));
         assert!(help.contains("--base-url <base-url>"));
         assert!(help.contains("provider API base URL"));
         assert!(help.contains("--model <model>"));
@@ -966,6 +1285,7 @@ brave_api_key = "brave-key"
         assert!(
             help.contains("llm config --base-url https://api.openai.com/v1 --model gpt-4.1-mini")
         );
+        assert!(help.contains("llm config --profile local --base-url http://localhost:11434/v1 --model llama3.2 --api-key local"));
         assert!(help.contains("llm config --model deepseek-v4"));
         assert!(help.contains("llm config --search-provider exa"));
         assert!(help.contains("llm config --exa-api-key \"$EXA_API_KEY\""));
