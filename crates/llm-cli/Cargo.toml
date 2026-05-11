@@ -1,0 +1,21 @@
+[package]
+name = "llm-cli"
+version = "0.3.0"
+edition = "2024"
+
+[lib]
+name = "llm_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "llm"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive", "env"] }
+llm-core = { path = "../llm-core" }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[dev-dependencies]
+serde_json = "1"

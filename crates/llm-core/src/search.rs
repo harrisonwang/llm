@@ -9,7 +9,7 @@ const DEFAULT_PROVIDER_PRIORITY: [SearchProvider; 2] = [SearchProvider::Exa, Sea
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize, ValueEnum)]
 #[serde(rename_all = "kebab-case")]
-pub(crate) enum SearchProvider {
+pub enum SearchProvider {
     Exa,
     Brave,
 }
@@ -24,12 +24,12 @@ impl fmt::Display for SearchProvider {
 }
 
 #[derive(Debug)]
-pub(crate) struct SearchCredentials {
-    pub(crate) provider: SearchProvider,
-    pub(crate) api_key: String,
+pub struct SearchCredentials {
+    pub provider: SearchProvider,
+    pub api_key: String,
 }
 
-pub(crate) fn resolve_credentials(
+pub fn resolve_credentials(
     requested_provider: Option<SearchProvider>,
     override_brave_api_key: Option<String>,
     override_exa_api_key: Option<String>,
@@ -108,7 +108,7 @@ fn normalize_key(value: Option<String>) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-pub(crate) fn search_instruction_from_prompt_arg(prompt_arg: &str) -> Result<String> {
+pub fn search_instruction_from_prompt_arg(prompt_arg: &str) -> Result<String> {
     let instruction = prompt_arg.trim();
     if instruction.is_empty() {
         return Err(anyhow!(
@@ -118,7 +118,7 @@ pub(crate) fn search_instruction_from_prompt_arg(prompt_arg: &str) -> Result<Str
     Ok(instruction.to_string())
 }
 
-pub(crate) fn build_search_query(stdin: Option<&str>, instruction: &str) -> String {
+pub fn build_search_query(stdin: Option<&str>, instruction: &str) -> String {
     const MAX_QUERY_CHARS: usize = 400;
     let mut parts = Vec::new();
     if let Some(context) = stdin.map(compact_for_search_query)
@@ -139,7 +139,7 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     text.chars().take(max_chars).collect()
 }
 
-pub(crate) async fn fetch_search_context(
+pub async fn fetch_search_context(
     provider: SearchProvider,
     api_key: &str,
     query: &str,
@@ -403,7 +403,7 @@ fn format_search_results(provider: &str, results: Vec<SearchResultContext>) -> R
     Ok(context)
 }
 
-pub(crate) fn build_prompt_with_search(
+pub fn build_prompt_with_search(
     stdin: Option<String>,
     search_context: &str,
     instruction: &str,
@@ -483,198 +483,4 @@ struct BraveWebResult {
     description: Option<String>,
     #[serde(default)]
     extra_snippets: Vec<String>,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn search_requires_command_line_prompt() {
-        let err = search_instruction_from_prompt_arg("   ")
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("missing search instruction"));
-    }
-
-    #[test]
-    fn search_query_includes_piped_context() {
-        let query = build_search_query(
-            Some("cargo 1.90.0 (840b83a10 2025-07-30)\n"),
-            "这个版本的cargo有什么特性？",
-        );
-
-        assert!(query.contains("cargo 1.90.0"));
-        assert!(query.contains("这个版本的cargo有什么特性？"));
-    }
-
-    #[test]
-    fn search_query_is_limited_to_api_max_length() {
-        let query = build_search_query(Some(&"x ".repeat(300)), &"y ".repeat(300));
-
-        assert_eq!(query.chars().count(), 400);
-    }
-
-    #[test]
-    fn credentials_prefer_exa_over_brave_when_provider_is_unspecified() {
-        let credentials = resolve_credentials(
-            None,
-            Some("brave-key".to_string()),
-            Some("exa-key".to_string()),
-            None,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(credentials.provider, SearchProvider::Exa);
-        assert_eq!(credentials.api_key, "exa-key");
-    }
-
-    #[test]
-    fn credentials_fall_back_to_brave_when_exa_key_is_missing() {
-        let credentials =
-            resolve_credentials(None, Some("brave-key".to_string()), None, None, None).unwrap();
-
-        assert_eq!(credentials.provider, SearchProvider::Brave);
-        assert_eq!(credentials.api_key, "brave-key");
-    }
-
-    #[test]
-    fn credentials_prefer_override_key_tier_over_config_priority() {
-        let credentials = resolve_credentials(
-            None,
-            Some("override-brave-key".to_string()),
-            None,
-            None,
-            Some("config-exa-key".to_string()),
-        )
-        .unwrap();
-
-        assert_eq!(credentials.provider, SearchProvider::Brave);
-        assert_eq!(credentials.api_key, "override-brave-key");
-    }
-
-    #[test]
-    fn credentials_honor_explicit_provider() {
-        let credentials = resolve_credentials(
-            Some(SearchProvider::Brave),
-            Some("brave-key".to_string()),
-            Some("exa-key".to_string()),
-            None,
-            None,
-        )
-        .unwrap();
-
-        assert_eq!(credentials.provider, SearchProvider::Brave);
-        assert_eq!(credentials.api_key, "brave-key");
-    }
-
-    #[test]
-    fn credentials_require_key_for_explicit_provider() {
-        let err = resolve_credentials(
-            Some(SearchProvider::Exa),
-            Some("brave-key".to_string()),
-            None,
-            None,
-            None,
-        )
-        .unwrap_err()
-        .to_string();
-
-        assert!(err.contains("missing Exa API key"));
-    }
-
-    #[test]
-    fn credentials_require_at_least_one_search_key() {
-        let err = resolve_credentials(None, None, None, None, None)
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("missing search API key"));
-    }
-
-    #[test]
-    fn format_brave_search_context_includes_results() {
-        let response: BraveSearchResponse = serde_json::from_value(serde_json::json!({
-            "web": {
-                "results": [
-                    {
-                        "title": "Rust Blog",
-                        "url": "https://blog.rust-lang.org/",
-                        "description": "Rust release notes.",
-                        "extra_snippets": ["Rust edition updates."]
-                    }
-                ]
-            }
-        }))
-        .unwrap();
-
-        let context = format_brave_search_context(&response).unwrap();
-
-        assert!(context.contains("<search_context>"));
-        assert!(context.contains("Provider: Brave Search"));
-        assert!(context.contains("Title: Rust Blog"));
-        assert!(context.contains("URL: https://blog.rust-lang.org/"));
-        assert!(context.contains("- Rust release notes."));
-        assert!(context.contains("- Rust edition updates."));
-        assert!(context.contains("</search_context>"));
-    }
-
-    #[test]
-    fn format_exa_search_context_includes_results() {
-        let response: ExaSearchResponse = serde_json::from_value(serde_json::json!({
-            "results": [
-                {
-                    "title": "Rust Blog",
-                    "url": "https://blog.rust-lang.org/",
-                    "highlights": ["Rust release notes."]
-                }
-            ]
-        }))
-        .unwrap();
-
-        let context = format_exa_search_context(&response).unwrap();
-
-        assert!(context.contains("Provider: Exa"));
-        assert!(context.contains("Title: Rust Blog"));
-        assert!(context.contains("- Rust release notes."));
-    }
-
-    #[test]
-    fn format_search_context_rejects_empty_results() {
-        let response: BraveSearchResponse = serde_json::from_value(serde_json::json!({
-            "web": {
-                "results": []
-            }
-        }))
-        .unwrap();
-
-        let err = format_brave_search_context(&response)
-            .unwrap_err()
-            .to_string();
-
-        assert!(err.contains("no search results"));
-    }
-
-    #[test]
-    fn search_prompt_includes_stdin_context_and_instruction() {
-        let prompt = build_prompt_with_search(
-            Some("cargo 1.90.0 (840b83a10 2025-07-30)\n".to_string()),
-            "<search_context>\nSource 1:\nTitle: Cargo\nURL: https://doc.rust-lang.org/cargo/\nSnippets:\n- Cargo docs.\n\n</search_context>",
-            "这个版本的cargo有什么特性？",
-        );
-
-        assert!(prompt.contains("<context>"));
-        assert!(prompt.contains("cargo 1.90.0"));
-        assert!(prompt.contains("<search_context>"));
-        assert!(prompt.contains("这个版本的cargo有什么特性？"));
-    }
-
-    #[test]
-    fn error_body_formats_json_error() {
-        let body = r#"{"error":{"code":"BAD_REQUEST","detail":"bad query","status":400},"type":"ErrorResponse"}"#;
-
-        assert_eq!(format_error_body(body), "BAD_REQUEST: bad query");
-    }
 }
